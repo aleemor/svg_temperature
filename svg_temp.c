@@ -1,9 +1,53 @@
-#include<stdlib.h>
-#include<stdbool.h>
-#include<stdio.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/timeb.h>
+#include <sys/time.h>
+#include <stdbool.h>
+#include <netdb.h>
 #include<math.h>
-#include<string.h>
-#include<time.h>
+
+// prametri seriale
+#define serial_baudrate B115200
+
+
+int serial_file_descriptor,bytes_read;
+
+
+unsigned char read_buffer[100]; 
+
+
+
+char serial_port[] = "/dev/cu.usbmodem14101";
+//char serial_port[] = "/dev/cu.usbserial-FT2K0SI2";
+//char serial_port[] = "/dev/cu.usbserial-FTHFGYDY";
+//char serial_port[] = "/dev/cu.usbserial-1410";
+//char serial_port[] = "/dev/ttyACM0";
+
+struct IR_sct {
+  uint8_t id;
+  uint8_t row_pkt_num;
+  uint8_t lenght;
+  uint8_t temp2;
+  uint16_t half_pixels[32];
+  uint16_t pixels_5[8];
+  uint8_t pixel[12];
+  uint8_t tlm_enfd;
+  uint8_t tlm_ednd;
+  uint8_t tlm_end;
+  uint8_t tlm_endd;
+} IR_sens;
 
 typedef struct svg
 {
@@ -14,8 +58,15 @@ typedef struct svg
 } svg;
 
 float temp[64];
+uint16_t temp_received[64];
 float max_range = 100.0;
 float min_range = 1.0;
+
+char time_string[64] = " ";
+
+uint8_t time_hour, dayy, time_minutes;
+
+void time_human();
 
 void my_rect(void);
 svg* svg_create(int width, int height);
@@ -26,26 +77,18 @@ void svg_free(svg* psvg);
 static void appendstringtosvg(svg* psvg, char* text);
 static void appendnumbertosvg(svg* psvg, int n);
 
+void serial_initialize();
+void serial_listen();
 void create_array();
 
 
 
-int main(void)
-{
-    puts("-----------------");
-    puts("| codedrome.com |");
-    puts("| SVG Library   |");
-    puts("-----------------\n"); 
+int main(void){
 
-
-    create_array();
-    my_rect(); 
+    //create_array();
+    serial_initialize();
+    serial_listen();
     
-    /*printf("temp[0] = %.1f\n",temp[0]);
-    printf("temp[1] = %.1f\n",temp[1]);
-    printf("temp[2] = %.1f\n",temp[2]);
-    */
-
     return EXIT_SUCCESS;
 }
 
@@ -114,9 +157,28 @@ void my_rect(void)
             }
         }
         svg_finalize(psvg);
-        svg_save(psvg, "my_rect.svg");
+        
+        time_human();
+        char filename_svg[34] = {};
+        char buf[] = {"IR_pictures/%s.svg"};
+        sprintf(filename_svg,buf,time_string);
+
+        svg_save(psvg, filename_svg);
         svg_free(psvg);
     }
+}
+
+void time_human() {
+  struct timeval  now;
+  struct tm*      local;
+  gettimeofday(&now, NULL);
+  local = localtime(&now.tv_sec);
+    char stri[] = {"%02d%02d%02d-%02d%02d%02d"};
+    /////global variables:
+  sprintf(time_string,stri,local->tm_year+1900, local->tm_mon+1, local->tm_mday,local->tm_hour, local->tm_min, local->tm_sec);
+  time_hour = local->tm_hour;
+  dayy = local->tm_mday;
+  time_minutes = local->tm_min;
 }
 
 svg* svg_create(int width, int height)
@@ -222,4 +284,52 @@ static void appendnumbertosvg(svg* psvg, int n)
     sprintf(sn, "%d", n);
 
     appendstringtosvg(psvg, sn);
+}
+
+void serial_initialize() {
+	serial_file_descriptor = open(serial_port,O_RDWR );
+    if(serial_file_descriptor == -1) {
+        printf("Serial port error\n");
+    }
+    else {
+        printf("Serial port opened\n");
+    }
+    struct termios SerialPortSettings;
+    tcgetattr(serial_file_descriptor, &SerialPortSettings);
+    cfsetispeed(&SerialPortSettings,serial_baudrate);
+    cfsetospeed(&SerialPortSettings,serial_baudrate);
+    SerialPortSettings.c_cflag &= ~PARENB;
+    SerialPortSettings.c_cflag &= ~CSTOPB;
+    SerialPortSettings.c_cflag &= ~CSIZE;
+    SerialPortSettings.c_cflag |=  CS8;
+    SerialPortSettings.c_cflag &= ~CRTSCTS;
+    SerialPortSettings.c_cflag |= CREAD | CLOCAL;
+    SerialPortSettings.c_iflag &= ~(IXON | IXOFF | IXANY);
+    SerialPortSettings.c_iflag &= ~(  ECHO | ECHOE | ISIG);
+    SerialPortSettings.c_oflag &= ~OPOST;
+    SerialPortSettings.c_cc[VMIN] = 100;
+    SerialPortSettings.c_cc[VTIME] = 1;
+    if((tcsetattr(serial_file_descriptor,TCSANOW,&SerialPortSettings)) != 0) {
+        printf("ERROR ! in Setting attributes\n");
+    }
+}
+
+void serial_listen(){
+    while (true){
+        bytes_read = read(serial_file_descriptor,&read_buffer,100);
+        if(bytes_read==100 && read_buffer[0]==0x20 ) {
+            memcpy(&IR_sens,read_buffer,100);
+            if(IR_sens.row_pkt_num==0){
+                memcpy(&temp_received[0],&IR_sens.half_pixels[0],32*sizeof(uint16_t));
+            }
+            else if(IR_sens.row_pkt_num==1){
+                memcpy(&temp_received[32],&IR_sens.half_pixels[0],32*sizeof(uint16_t));
+                for(int i=0;i<64;i++){
+                    temp[i]=temp_received[i]/100.0;
+                    printf("%f\n",temp[i]);
+                    my_rect(); 
+                }
+            }
+        }
+    }
 }
